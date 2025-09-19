@@ -693,6 +693,7 @@ def on_connect_mqtt(client, mybatterycontrol, flags, rc):
     client.subscribe(mybatterycontrol.mqtt_topic_root+"/kp")
     client.subscribe(mybatterycontrol.mqtt_topic_root+"/ki")
     client.subscribe(mybatterycontrol.mqtt_topic_root+"/batmax")
+    client.subscribe(mybatterycontrol.mqtt_topic_root+"/batmin")
     logging.debug(f'Subscribed on: home/smartme/Pt')
     logging.debug(f'Subscribed on: {mybatterycontrol.mqtt_topic_root}/enable')
     logging.debug(f'Subscribed on: {mybatterycontrol.mqtt_topic_root}/ovr')
@@ -723,6 +724,13 @@ def on_message_mqtt(client, mybatterycontrol, msg):
         if limit < 100:
             limit = 100
         mybatterycontrol.power_limit_charge = limit
+    if msg.topic == mybatterycontrol.mqtt_topic_root+"/batmin":
+        limit = float(msg.payload)
+        if limit > 700:
+            limit = 700
+        if limit < 0:
+            limit = 0
+        mybatterycontrol.power_limit = limit
     if msg.topic == mybatterycontrol.mqtt_topic_root+"/ovr":
         mybatterycontrol.ovr = int(msg.payload)
     if msg.topic == mybatterycontrol.mqtt_topic_root+"/kp":
