@@ -1,430 +1,455 @@
-from datetime import datetime
-from pysolar.solar import *
-import pytz, math
-import sys
-import numpy as np
-import requests
-from requests.auth import HTTPBasicAuth
-from json import loads, dumps
-import socket, time, signal
-from threading import Thread, Event
-import queue
-import paho.mqtt.client as paho
+"""Diematic boiler readout (RS485 Modbus-RTU via TCP gateway) -> MQTT.
+
+The boiler is bus master most of the time and only answers our requests in
+its slave window, so a request is (re)sent whenever the bus has been quiet for
+IDLE_GAP seconds, until it is answered or its deadline expires.
+
+Robustness:
+  * one loop owns the socket: no helper threads that can die or block silently
+  * stream parser: frames are found in a receive buffer by address, function,
+    length and CRC, so TCP fragmentation/coalescing does not lose frames
+  * every error closes the socket and reconnects in-process with backoff; the
+    gateway is restarted over HTTP only after repeated failures
+  * systemd watchdog (WATCHDOG=1) and the MQTT heartbeat are sent only after a
+    valid frame, so "connected but no data" is detected as well
+  * retained /set messages are ignored and a write is skipped when the boiler
+    already holds that value
+
+The PV estimate (home/heating/estpvpower) lives in estpvpower.py.
+"""
 import logging
+import os
+import signal
+import socket
+import time
+from threading import Event, Lock
+
+import paho.mqtt.client as paho
+import requests
 from systemd.journal import JournaldLogHandler
 
 journald_handler = JournaldLogHandler()
-journald_handler.setFormatter(logging.Formatter(
-    '[%(levelname)s] %(message)s'
-))
+journald_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
 logger = logging.getLogger('diematic')
 logger.addHandler(journald_handler)
 logger.setLevel(logging.INFO)
 
 
+# ============================================================
+# Configuration
+# ============================================================
+GATEWAY_HOST = '192.168.1.7'
+GATEWAY_PORT = 88
+GATEWAY_RESTART_URL = 'http://192.168.1.7/success_en.html'
+GATEWAY_RESTART_DATA = ("__SL_P_WRT=OK&__SL_P_WFT=NO"
+                        "&__SL_P_WUN.value=admin&__SL_P_WUP.value=admin")
+GATEWAY_RESTART_SETTLE = 10.0
+GATEWAY_RESTART_AFTER_FAILS = 3   # consecutive failed sessions before HTTP restart
 
+MQTT_HOST = '127.0.0.1'
+MQTT_PORT = 1883
+MQTT_TOPIC_ROOT = 'home/heating'
+
+CONNECT_TIMEOUT = 10.0
+RECV_POLL = 0.1                   # socket poll interval
+IDLE_GAP = 0.7                    # bus quiet this long -> our turn to send
+REQUEST_DEADLINE = 20.0           # give up on one request after this
+NO_DATA_TIMEOUT = 60.0            # no valid frame for this long -> reconnect
+WRITE_ATTEMPTS = 3
+BACKOFF_MIN = 2.0
+BACKOFF_MAX = 60.0
+RX_BUFFER_MAX = 4096
+
+ADDRESS = 0x0A
+READ_HOLDING = 0x03
+WRITE_MULTIPLE = 0x10
+
+# register blocks read round-robin
+READ_BLOCKS = [
+    {'adr': 7,   'nb': 14},
+    {'adr': 89,  'nb': 8},
+    {'adr': 59,  'nb': 4},
+    {'adr': 427, 'nb': 33},
+]
+
+# register -> topic name, scale
+PUBLISH = {
+    7:   {'nm': 'exttemp',           'sc': 10},
+    8:   {'nm': 'sumwintemp',        'sc': 10},
+    9:   {'nm': 'antifreezeexttemp', 'sc': 10},
+    13:  {'nm': 'daysantifreeze',    'sc': 1},
+    14:  {'nm': 'daytemp',           'sc': 10},
+    15:  {'nm': 'nighttemp',         'sc': 10},
+    16:  {'nm': 'antifreezetemp',    'sc': 10},
+    17:  {'nm': 'mode',              'sc': 1},
+    59:  {'nm': 'watertempset',      'sc': 10},
+    96:  {'nm': 'watertempnight',    'sc': 10},
+    438: {'nm': 'largetemp',         'sc': 10},
+    451: {'nm': 'ionizationcurrent', 'sc': 10},
+    452: {'nm': 'supplytemp',        'sc': 10},
+    453: {'nm': 'returntemp',        'sc': 10},
+    454: {'nm': 'exhausttemp',       'sc': 10},
+    455: {'nm': 'rpm',               'sc': 1},
+    456: {'nm': 'pressure',          'sc': 10},
+    459: {'nm': 'watertemp',         'sc': 10},
+}
+REG_IONIZATION = 451
+REG_RPM = 455
+
+# /set/<name> -> register, scale
+WRITABLE = {
+    'sumwin':         (8,  10),
+    'daytemp':        (14, 10),
+    'nighttemp':      (15, 10),
+    'mode':           (17, 1),
+    'watertempset':   (59, 10),
+    'telecmd1':       (94, 1),
+    'watertempnight': (96, 10),
+}
+
+
+def sd_notify(state):
+    """Minimal sd_notify(3); no-op when not started by systemd."""
+    addr = os.environ.get('NOTIFY_SOCKET')
+    if not addr:
+        return
+    if addr.startswith('@'):
+        addr = '\0' + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(state.encode())
+    except OSError as e:
+        logger.warning(f'sd_notify failed: {e}')
+
+
+# ============================================================
+# Modbus helpers
+# ============================================================
 def calc_crc(data):
     crc = 0xFFFF
     for pos in data:
         crc ^= pos
-        for i in range(8):
-            if ((crc & 1) != 0):
-                crc >>= 1
-                crc ^= 0xA001
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
             else:
                 crc >>= 1
     return crc
 
-class GracefulKiller:
-  kill_now = False
-  def __init__(self):
-    signal.signal(signal.SIGINT, self.exit_gracefully)
-    signal.signal(signal.SIGTERM, self.exit_gracefully)
-    return
 
-  def exit_gracefully(self, *args):
-    self.kill_now = True
-    return
+def with_crc(frame):
+    crc = calc_crc(frame)
+    return bytes(frame) + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
-class DiematicConnect(Thread):
-    READ_ANALOG_HOLDING_REGISTERS=0x03;
-    WRITE_MULTIPLE_REGISTERS=0x10;
-    ANSWER_FRAME_MIN_LENGTH=0x07;
-    ANSWER_FRAME_MAX_LENGTH=0x100;
-    ADDRESS = 0xa;
-    def __init__(
-            self,
-            signal,
-            host,
-            port,
-            mqtt_topic_root,
-            timeout=1,
-            on_connected_callback=None,
-            on_receive_callback=None,
-            on_disconnected_callback=None,
-            userdata=None,
-            ):
 
-        self.heartbeat = 0
-        self.init_modbus = False
+def read_request(adr, nb):
+    # trailing 0x00 kept from the original implementation (gateway framing)
+    return with_crc([ADDRESS, READ_HOLDING, adr >> 8, adr & 0xFF, nb >> 8, nb & 0xFF]) + b'\x00'
+
+
+def write_request(adr, values):
+    frame = [ADDRESS, WRITE_MULTIPLE, adr >> 8, adr & 0xFF, 0x00, len(values), 2 * len(values)]
+    for v in values:
+        frame += [(v >> 8) & 0xFF, v & 0xFF]
+    return with_crc(frame) + b'\x00'
+
+
+def write_ack(adr, count):
+    return with_crc([ADDRESS, WRITE_MULTIPLE, adr >> 8, adr & 0xFF, 0x00, count])
+
+
+def decode(raw):
+    """Diematic uses sign-magnitude for negative values."""
+    return -float(raw & 0x7FFF) if raw >= 0x8000 else raw
+
+
+def extract_frames(buf, read_byte_counts):
+    """Pull complete, CRC-valid frames addressed from the boiler out of buf.
+
+    Returns (frames, consumed). Bytes that cannot start one of our frames are
+    skipped; an incomplete candidate at the end stays in the buffer.
+    """
+    frames = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        if buf[i] != ADDRESS:
+            i += 1
+            continue
+        if i + 1 >= n:
+            break                                   # 0x0A at the end: wait
+        func = buf[i + 1]
+        if func == READ_HOLDING:
+            if i + 2 >= n:
+                break
+            count = buf[i + 2]
+            if count not in read_byte_counts:
+                i += 1
+                continue
+            end = i + 5 + count
+        elif func == WRITE_MULTIPLE:
+            end = i + 8
+        else:
+            i += 1
+            continue
+        if end > n:
+            break                                   # wait for the rest
+        body = buf[i:end - 2]
+        if calc_crc(body) == buf[end - 2] | (buf[end - 1] << 8):
+            frames.append(bytes(buf[i:end]))
+            i = end
+        else:
+            i += 1
+    return frames, i
+
+
+# ============================================================
+# Diematic
+# ============================================================
+class Diematic:
+    def __init__(self, stop, mqtt, topic_root=MQTT_TOPIC_ROOT,
+                 host=GATEWAY_HOST, port=GATEWAY_PORT):
+        self.stop = stop
+        self.mqtt = mqtt
+        self.topic_root = topic_root
         self.host = host
         self.port = port
-        self.timeout = timeout
-        self.on_connected_callback = on_connected_callback
-        self.on_receive_callback = on_receive_callback
-        self.on_disconnected_callback = on_disconnected_callback
-        self.stop_signal = signal
-        self.read_request_queue = queue.Queue()
-        self.write_request_queue = queue.Queue(maxsize=1)
-        self.request = bytearray()
-        self.mqtt_topic_root = mqtt_topic_root
-        self.dictionary = dict()
-        self.dictionary[0] = {"adr":7,"nb":14}
-        self.dictionary[1] = {"adr":89,"nb":8}
-        self.dictionary[2] = {"adr":59,"nb":4}
-        self.dictionary[3] = {"adr":427,"nb":33}
-        self.pub_dict = dict()
-        self.pub_dict[7]   = {'nm':'exttemp'           , 'sc':10}
-        self.pub_dict[8]   = {'nm':'sumwintemp'        , 'sc':10}
-        self.pub_dict[9]   = {'nm':'antifreezeexttemp' , 'sc':10}
-        #self.pub_dict[10]  = {'nm':'onoffstatepump'    , 'sc':1 }
-        #self.pub_dict[11]  = {'nm':'speedpump'         , 'sc':1 }
-        self.pub_dict[13]  = {'nm':'daysantifreeze'    , 'sc':1 }
-        self.pub_dict[14]  = {'nm':'daytemp'           , 'sc':10}
-        self.pub_dict[15]  = {'nm':'nighttemp'         , 'sc':10}
-        self.pub_dict[16]  = {'nm':'antifreezetemp'    , 'sc':10}
-        self.pub_dict[17]  = {'nm':'mode'              , 'sc':1 }
-        #self.pub_dict[20]  = {'nm':'slope'             , 'sc':10}
-        self.pub_dict[59] = {'nm':'watertempset' , 'sc':10}
-        #self.pub_dict[89]  = {'nm':'baseecs'           , 'sc':1 }
-        #self.pub_dict[94] = {'nm':'telecmd1'          , 'sc':1 }
-        #self.pub_dict[95] = {'nm':'telecmd2'          , 'sc':1 }
-        self.pub_dict[96] = {'nm':'watertempnight'    , 'sc':10 }
-        #self.pub_dict[437] = {'nm':'onoffboilerflow'   , 'sc':1 }
-        self.pub_dict[438] = {'nm':'largetemp'         , 'sc':10}
-        self.pub_dict[451] = {'nm':'ionizationcurrent' , 'sc':10}
-        self.pub_dict[452] = {'nm':'supplytemp'        , 'sc':10}
-        self.pub_dict[453] = {'nm':'returntemp'        , 'sc':10}
-        self.pub_dict[454] = {'nm':'exhausttemp'       , 'sc':10}
-        self.pub_dict[455] = {'nm':'rpm'               , 'sc':1 }
-        self.pub_dict[456] = {'nm':'pressure'          , 'sc':10}
-        self.pub_dict[459] = {'nm':'watertemp'         , 'sc':10}
-        self.mqtt = userdata
-        self.reading = Thread(
-            target=self.recv_send,
-            args=(self.on_receive_callback, self.on_disconnected_callback)
-        )
-        #
-        Thread.__init__(self)
-        return
+        self.sock = None
+        self.read_byte_counts = {b['nb'] * 2: b for b in READ_BLOCKS}
+        self.registers = {}               # last raw value read per register
+        self._lock = Lock()
+        self._pending_writes = {}         # register -> raw value (latest wins)
+        self._next_read = 0
+        self._current = None              # outstanding request
 
+    # ---------- called from the MQTT thread ----------
+    def queue_write(self, name, payload):
+        reg, scale = WRITABLE[name]
+        raw = int(round(float(payload) * scale)) if scale != 1 else int(payload)
+        with self._lock:
+            known = self.registers.get(reg)
+            if known == raw:
+                logger.info(f'set/{name}={payload}: boiler already has this value, skipped')
+                self._pending_writes.pop(reg, None)
+                return
+            self._pending_writes[reg] = raw
+        logger.info(f'set/{name}={payload}: write of register {reg}={raw} queued')
 
-    # run by the Thread object
-    def run(self):
-        logger.info('Restart Modbus-Interface...')
-        res = requests.post('http://192.168.178.7/reload_en.html',headers={'Authorization':'Basic XXXXXXXXX'},data="__SL_P_WRT=OK&__SL_P_WFT=NO&__SL_P_WUN.value=admin&__SL_P_WUP.value=admin")
-        logger.info(res.text)
-        logger.info('Wait 10s...')            
-        time.sleep(10)
-        logger.info('Modbus restarted')        
-        #
-        logger.info('Starting mydiematic...')
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(10)
-        # self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # now connect
-        try:
-            logger.info('Connecting...')
-            self.sock.connect((self.host, self.port))
-            if self.on_connected_callback:
-                self.on_connected_callback(self.host, self.port)
-        except Exception as e:
-            logger.info(f'Timeout during connection {e}')
-            self.sock.close()
-            return False
-        # start a thread to read on socket
-        self.reading.start()
-        loop = True
-        while loop:
-            for i,_ in self.dictionary.items():
-                self.read_request_queue.put_nowait(self.read_request(self.dictionary[i]['adr'],self.dictionary[i]['nb']))
-                self.request = self.read_request_queue.get_nowait()
-                read_request_task = Thread(target=self.read_request_queue.join())
-                read_request_task.start()
-                read_request_task.join(6) # blocks, timeout after 6s
-            if not self.write_request_queue.empty():
-                self.request = self.write_request_queue.get_nowait()
-                logger.info(f'write request queued {self.request.hex()}')
-                write_request_task = Thread(target=self.write_request_queue.join())
-                write_request_task.start()
-                write_request_task.join(6) # blocks, timeout after 6s
-            if self.reading.is_alive():
-                #logger.info(f'Health {self.read_request_queue.qsize()}{self.write_request_queue.qsize()}')
-                # publish heartbeat as timestamp in unix timeformat for now
-                self.mqtt.publish(self.mqtt_topic_root+"/heartbeat",int(time.time()), retain=True);
-                continue
-            else:
-                logger.info('reading not alive')
-                loop = False
-                raise ValueError('reading not alive')
-                break
-        #logger.info('end of run')
-        self.reading.join(0.1)
-        self.sock.close()
-        self.on_disconnected_callback()
+    # ---------- request scheduling ----------
+    def _next_request(self):
+        with self._lock:
+            if self._pending_writes:
+                reg, raw = next(iter(self._pending_writes.items()))
+                del self._pending_writes[reg]
+                return {'kind': 'write', 'reg': reg, 'raw': raw,
+                        'frame': write_request(reg, [raw]), 'ack': write_ack(reg, 1),
+                        'attempt': 1, 'started': time.monotonic()}
+        block = READ_BLOCKS[self._next_read]
+        self._next_read = (self._next_read + 1) % len(READ_BLOCKS)
+        return {'kind': 'read', 'block': block,
+                'frame': read_request(block['adr'], block['nb']),
+                'started': time.monotonic()}
 
-    def read_request(self,regAddress,regNb):
-       request=bytearray();
-       request.append(self.ADDRESS);
-       request.append(self.READ_ANALOG_HOLDING_REGISTERS);
-       request.append((regAddress>>8)& 0xFF);
-       request.append(regAddress & 0xFF);
-       request.append((regNb>>8)& 0xFF);
-       request.append(regNb & 0xFF);
-       crc=calc_crc(request);
-       request.append(crc & 0xFF);
-       request.append((crc>>8)& 0xFF);
-       request.append(0);
-       logger.debug(f'Send read request: {request.hex()}');
-       #self.sock.send(request);
-       return request
-
-    def write_request(self,regAddress,data=[0]):
-        request=bytearray();
-        request.append(self.ADDRESS)
-        request.append(self.WRITE_MULTIPLE_REGISTERS);
-        request.append((regAddress>>8)& 0xFF);
-        request.append(regAddress & 0xFF);
-        request.append(0x00);
-        request.append(len(data)); # amount of registers to write
-        request.append(2*len(data)); # number of bytes in
-        for reg in data:
-            request.append((reg>>8)& 0xFF);
-            request.append(reg & 0xFF);
-        crc=calc_crc(request);
-        request.append(crc & 0xFF);
-        request.append((crc>>8)& 0xFF);
-        request.append(0x0);
-        return request
-
-    def recv_send(self, on_receive_callback, on_disconnected_callback):
-        # set a buffer size ( could be 2048 or 4096 / power of 2 )
-        size = 1024
-        self.sock.settimeout(self.timeout)
-        loop = True
-        while loop:
-            try:
-                data = self.sock.recv(size)
-                if data:
-                    if on_receive_callback:
-                        try:
-                            on_receive_callback(self,data)
-                        except Exception as e:
-                            if self.debug:
-                                logger.info(f'Receive Callback Failed {e}')
-            except socket.timeout:
-                try:
-                    logger.debug(f'Send request {self.request.hex()}')
-                    self.sock.send(self.request) #<---- From Queue
-                except Exception as e:
-                    logger.info('read/write request failed {e}')
-                    raise ValueError('read/write request failed')
-                    loop = False
-                    break
-            except Exception as e:
-                logger.info(f'connection exception {e}')
-                raise ValueError('connection exception')
-                sys.exit()
-                loop = False
-                break
-        return
-
-def publish_callback(mydiematic,data):
-    logger.debug(f'Received {data[2]}')
-    mydiematic.mqtt.publish(mydiematic.mqtt_topic_root+"/estpvpower",estpower(datetime.datetime.now(pytz.timezone("Europe/Berlin"))));
-    for _,item in mydiematic.dictionary.items():
-        if data[2] == item.get('nb') * 2:
-            adr_enum = 0
-            poweron = False
-            for i in range(0,data[2],2):
-                logger.debug(f' {item.get("adr")+adr_enum} {0x100*data[3+i]+data[4+i]}')
-                if (item.get('adr')+adr_enum) in mydiematic.pub_dict:
-                    topic = mydiematic.mqtt_topic_root + '/' + mydiematic.pub_dict[item.get('adr')+adr_enum].get('nm')
-                    if mydiematic.pub_dict[item.get('adr')+adr_enum].get('sc') == 1:
-                        value = int(0x100*data[3+i]+data[4+i])
-                        if value >= 0x8000:
-                            value = -1.0*(value & 0x7fff)
-                    else:
-                        value = int(0x100*data[3+i]+data[4+i])
-                        if value >= 0x8000:
-                            value = -1.0*(value &  0x7fff)
-                        value = value / mydiematic.pub_dict[item.get('adr')+adr_enum].get('sc')
-                    logger.debug(f'{topic} {value}')
-                    mydiematic.mqtt.publish(topic,round(value,2))
-                if item.get('adr')+adr_enum == 451: # ionizaation current > 0 --> power on
-                    if int(0x100*data[3+i]+data[4+i]) > 0:
-                        poweron = True
-                if item.get('adr')+adr_enum == 455:
-                    value = 0.0
-                    if poweron:
-                        value = int(0x100*data[3+i]+data[4+i]) / 5900 * 24.5 * 0.61
-                    topic = mydiematic.mqtt_topic_root + '/power'
-                    mydiematic.mqtt.publish(topic,round(value,2))
-                adr_enum = adr_enum + 1
-    return
-
-def receive_callback(mydiematic,data):
-    logger.debug(f'Received {data.hex()}')
-    #check  modBus address
-    if (data[0] != mydiematic.ADDRESS):
-        logger.debug('Answer modbus address Error');
-        return;
-    #check  modBus feature
-    if (not ((data[1] == mydiematic.READ_ANALOG_HOLDING_REGISTERS) or (data[1] == mydiematic.WRITE_MULTIPLE_REGISTERS))):
-        logger.debug('Answer modbus feature Error');
-        return;
-    # process ACK after writeing
-    if data[1] == mydiematic.WRITE_MULTIPLE_REGISTERS:
-        waited_ack=mydiematic.request[0:6];
-        crc=calc_crc(waited_ack);
-        waited_ack.append(crc & 0xFF);
-        waited_ack.append((crc>>8)& 0xFF);
-        if (waited_ack==data[0:8]):
-            logger.info('Write Ack');
-            mydiematic.write_request_queue.task_done()
+    def _request_expired(self, now):
+        req = self._current
+        if req['kind'] == 'write' and req['attempt'] < WRITE_ATTEMPTS:
+            logger.warning(f"write register {req['reg']} not acknowledged, retry {req['attempt'] + 1}")
+            req['attempt'] += 1
+            req['started'] = now
+            return
+        if req['kind'] == 'write':
+            logger.warning(f"write register {req['reg']} failed after {WRITE_ATTEMPTS} attempts, dropped")
         else:
-            logger.info(f'Write NO Ack {data.hex()}')
-        return
-    # check for finishing a read request
-    check = []
-    for _,nb in mydiematic.dictionary.items():
-        check.append(data[2] == nb.get('nb')*2)
-    if any(check):
+            logger.info(f"read block {req['block']['adr']} not answered within {REQUEST_DEADLINE:.0f}s")
+        self._current = self._next_request()
+
+    # ---------- frame handling ----------
+    def _handle_frame(self, frame):
+        """Returns True for a valid answer to one of our requests."""
+        if frame[1] == WRITE_MULTIPLE:
+            req = self._current
+            if req and req['kind'] == 'write' and frame == req['ack']:
+                logger.info(f"write register {req['reg']}={req['raw']} acknowledged")
+                with self._lock:
+                    self.registers[req['reg']] = req['raw']
+                self._current = self._next_request()
+                return True
+            return False
+        block = self.read_byte_counts[frame[2]]
+        values = [(frame[3 + 2 * k] << 8) | frame[4 + 2 * k] for k in range(block['nb'])]
+        self._publish_block(block['adr'], values)
+        req = self._current
+        if req and req['kind'] == 'read' and req['block'] is block:
+            self._current = self._next_request()
+        return True
+
+    def _publish_block(self, adr, values):
+        with self._lock:
+            for k, raw in enumerate(values):
+                self.registers[adr + k] = raw
+        poweron = False
+        for k, raw in enumerate(values):
+            reg = adr + k
+            item = PUBLISH.get(reg)
+            if item:
+                value = decode(raw)
+                if item['sc'] != 1:
+                    value = value / item['sc']
+                self.mqtt.publish(f"{self.topic_root}/{item['nm']}", round(value, 2))
+            if reg == REG_IONIZATION and raw > 0:
+                poweron = True
+            if reg == REG_RPM:
+                power = raw / 5900 * 24.5 * 0.61 if poweron else 0.0
+                self.mqtt.publish(f'{self.topic_root}/power', round(power, 2))
+
+    def _alive(self):
+        sd_notify('WATCHDOG=1')
+        self.mqtt.publish(f'{self.topic_root}/heartbeat', int(time.time()), retain=True)
+
+    # ---------- connection ----------
+    def restart_gateway(self):
+        logger.info('Restart Modbus gateway...')
         try:
-            mydiematic.read_request_queue.task_done()
-        except:
-            logger.info('received data but task empty')
-    else:
-        return
-    # check lengt
-    answerLength=5+data[2];
-    if ((len(data) < answerLength )):
-        logger.debug('Answer Length Error');
-        return;
-    # check CRC
-    crc=calc_crc(data[0:answerLength-2]);
-    if (crc!=0x100*data[answerLength-1]+data[answerLength-2]):
-        logger.debug('Answer CRC error');
-        return;
-    publish_callback(mydiematic,data)
-    return
+            res = requests.post(GATEWAY_RESTART_URL,
+                                headers={'Authorization': 'Basic YWRtaW46YWRtaW4='},
+                                data=GATEWAY_RESTART_DATA, timeout=5)
+            logger.info(f'gateway restart answered {res.status_code}')
+        except requests.RequestException as e:
+            logger.warning(f'gateway restart failed: {e}')
+            return
+        self.stop.wait(GATEWAY_RESTART_SETTLE)
 
-def connected_callback(host,port):
-    logger.info(f'Mydiematic connected: {host}:{port}')
-    return
+    def _connect(self):
+        self.sock = socket.create_connection((self.host, self.port), CONNECT_TIMEOUT)
+        self.sock.settimeout(RECV_POLL)
+        logger.info(f'connected to {self.host}:{self.port}')
 
-def disconnected_callback(msg=None):
-    logger.info(f'Mydiematic stopped {msg}')
-    return
-
-def on_connect_mqtt(client, mydiematic, flags, rc):
-    logger.info(f'Mqtt Client connected {rc}')
-    client.subscribe(mydiematic.mqtt_topic_root+"/set/#")
-    return
-
-def on_disconnect_mqtt(client, userdata, rc):
-    logger.info(f'Mqtt Client disconnected {rc}')
-    return
-
-def on_message_mqtt(client, mydiematic, msg):
-    logger.info(f'{msg.topic} {msg.payload}')
-    logger.debug(f'{msg.payload}')
-    if '/'.join(msg.topic.split('/')[0:-1]) == mydiematic.mqtt_topic_root+'/set':
-        write_request = None
-        if msg.topic.split('/')[-1] == 'sumwin':
-            write_request = mydiematic.write_request(8,[int(float(msg.payload)*10)])
-        if msg.topic.split('/')[-1] == 'daytemp':
-            write_request = mydiematic.write_request(14,[int(float(msg.payload)*10)])
-        if msg.topic.split('/')[-1] == 'mode':
-            write_request = mydiematic.write_request(17,[int(msg.payload)])
-        if msg.topic.split('/')[-1] == 'telecmd1':
-            write_request = mydiematic.write_request(94,[int(msg.payload)])
-        if msg.topic.split('/')[-1] == 'watertempnight':
-            write_request = mydiematic.write_request(96,[int(float(msg.payload)*10)])
-        if msg.topic.split('/')[-1] == 'watertempset':
-            write_request = mydiematic.write_request(59,[int(float(msg.payload)*10)])
-        if msg.topic.split('/')[-1] == 'nighttemp':
-            write_request = mydiematic.write_request(15,[int(float(msg.payload)*10)])
-        if write_request:
+    def _close(self):
+        if self.sock is not None:
             try:
-                mydiematic.write_request_queue.put_nowait(write_request)
-            except:
-                logger.info('Write queue is full, wait and send again')
-    return
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _session(self):
+        """Runs until stop or an error; returns True if valid data was received."""
+        buf = bytearray()
+        now = time.monotonic()
+        last_rx = last_tx = now
+        last_valid = now
+        got_data = False
+        self._current = self._next_request()
+        while not self.stop.is_set():
+            try:
+                data = self.sock.recv(1024)
+                if not data:
+                    raise ConnectionError('gateway closed the connection')
+                buf.extend(data)
+                last_rx = time.monotonic()
+            except socket.timeout:
+                pass
+            now = time.monotonic()
+
+            if buf:
+                frames, used = extract_frames(buf, self.read_byte_counts)
+                del buf[:used]
+                if len(buf) > RX_BUFFER_MAX:
+                    del buf[:-RX_BUFFER_MAX // 2]
+                for frame in frames:
+                    if self._handle_frame(frame):
+                        last_valid = now
+                        got_data = True
+                        self._alive()
+
+            if now - last_valid > NO_DATA_TIMEOUT:
+                raise TimeoutError(f'no valid answer for {NO_DATA_TIMEOUT:.0f}s')
+            if now - self._current['started'] > REQUEST_DEADLINE:
+                self._request_expired(now)
+            if now - last_rx >= IDLE_GAP and now - last_tx >= IDLE_GAP:
+                self.sock.sendall(self._current['frame'])
+                last_tx = now
+        return got_data
+
+    def run(self):
+        fails = 0
+        backoff = BACKOFF_MIN
+        while not self.stop.is_set():
+            if fails and fails % GATEWAY_RESTART_AFTER_FAILS == 0:
+                self.restart_gateway()
+            got_data = False
+            try:
+                self._connect()
+                got_data = self._session()
+            except (OSError, ConnectionError, TimeoutError) as e:
+                logger.warning(f'connection error: {e}')
+            except Exception as e:
+                logger.exception(f'unexpected error: {e}')
+            finally:
+                self._close()
+            if got_data:
+                fails, backoff = 0, BACKOFF_MIN
+            else:
+                fails += 1
+            if self.stop.wait(backoff):
+                break
+            backoff = min(BACKOFF_MAX, backoff * 2)
+        logger.info('stopped')
 
 
-def estpower(date):
-    latitude = 0.0
-    longitude = 0.0
-    beta_pv = 70/180*math.pi
-    alpha_pv = 200/180*math.pi
-    area = 8.0 * 0.95
+# ============================================================
+# MQTT
+# ============================================================
+def on_connect_mqtt(client, diematic, flags, rc):
+    logger.info(f'MQTT connected {rc}')
+    client.subscribe(f'{diematic.topic_root}/set/#')
 
-    #date = datetime.datetime.now(pytz.timezone("Europe/Berlin"))
-    beta_sun = get_altitude(latitude, longitude, date)/180*math.pi
-    alpha_sun = get_azimuth(latitude, longitude, date)/180*math.pi
 
-    pv = np.array([math.sin(alpha_pv),-math.cos(alpha_pv),math.sin(beta_pv)])
-    sun = np.array([math.sin(alpha_sun),-math.cos(alpha_sun),math.sin(beta_sun)])
+def on_disconnect_mqtt(client, diematic, rc):
+    logger.info(f'MQTT disconnected {rc}')
 
-    incident_angle = math.acos(np.dot(pv,sun)/np.linalg.norm(pv)/np.linalg.norm(sun))*180/math.pi;
-    # model
-    if incident_angle >=0 and incident_angle <= 80:
-        eta = 22 - (1/(math.exp(0.0015*(95-incident_angle)**1.3)-1))
-    else:
-        eta = 1
-    theoretic_power = radiation.get_radiation_direct(date, beta_sun*180/math.pi) * area * eta/100;
 
-    return theoretic_power
-
+def on_message_mqtt(client, diematic, msg):
+    if msg.retain:
+        # replayed on every (re)subscribe: never re-send old commands
+        logger.info(f'ignored retained {msg.topic} {msg.payload}')
+        return
+    name = msg.topic.rsplit('/', 1)[-1]
+    if name not in WRITABLE:
+        return
+    try:
+        diematic.queue_write(name, msg.payload.decode().strip())
+    except ValueError as e:
+        logger.warning(f'bad payload on {msg.topic}: {msg.payload} ({e})')
 
 
 def main():
     logger.info('init')
+    stop = Event()
+
+    def handle_signal(*_):
+        logger.info('stop signal received')
+        stop.set()
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
     mqtt = paho.Client()
+    diematic = Diematic(stop, mqtt)
+    mqtt.user_data_set(diematic)          # before connect: no on_connect race
     mqtt.on_connect = on_connect_mqtt
     mqtt.on_message = on_message_mqtt
     mqtt.on_disconnect = on_disconnect_mqtt
-    mqtt.connect("127.0.0.1", 1883, 60)
+    mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
+    mqtt.connect_async(MQTT_HOST, MQTT_PORT, 60)
     mqtt.loop_start()
-    logger.info('Mqtt Client started')
-    stop_signal = Event()
-    mydiematic = DiematicConnect(
-        stop_signal,
-        '192.168.178.7',
-        88,
-        mqtt_topic_root='home/heating',
-        timeout=0.7,
-        on_connected_callback=connected_callback,
-        on_receive_callback=receive_callback,
-        on_disconnected_callback=disconnected_callback,
-        userdata=mqtt,
-    )
-    mqtt.user_data_set(mydiematic)
-    killer = GracefulKiller()
-    mydiematic.start()
-    #mydiematic.join(1)
-    while not killer.kill_now:
-        if not mydiematic.reading.is_alive():
-            logger.info('Try to restart...')
-            raise ValueError('Restart')
-        time.sleep(2)
-    stop_signal.set()
+
+    diematic.run()
+
     mqtt.loop_stop()
     mqtt.disconnect()
-    #mydiematic.join(10)
-    logger.info("End of mydiematic.")
-    return
+    logger.info('End of diematic.')
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

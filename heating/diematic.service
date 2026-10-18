@@ -1,0 +1,21 @@
+[Unit]
+Description=diematic
+Wants=network-online.target signal.service
+After=network-online.target signal.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/www/diematic/diematic.py
+WorkingDirectory=/var/www/diematic
+User=pi
+# The script sends WATCHDOG=1 only after a valid boiler frame; no valid
+# frame for 120 s -> systemd kills and restarts it (replaces the cron job).
+WatchdogSec=120
+NotifyAccess=main
+TimeoutStopSec=10
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
